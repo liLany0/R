@@ -1,41 +1,112 @@
-library(readxl)      
-library(dplyr)       
+library(readxl)
+library(dplyr)
+library(tidyr)
 library(data.tree)
 library(ggplot2)
 library(scales)
 library(mc2d)
 
-file_name <- "MelatoninSCNL.xlsx"
 
-revenue_data <- read_excel(file_name, sheet = "Revenue")
-costs_data <- read_excel(file_name, sheet = "Costs")
+file_name <- "Melatonin.xlsx"
+
+revenue_data     <- read_excel(file_name, sheet = "Revenue")
+costs_data       <- read_excel(file_name, sheet = "Costs")
 assumptions_data <- read_excel(file_name, sheet = "Assumptions")
 
-price_per_pack <- assumptions_data %>% filter(Parameters == "Price_Per_pack(1mg)30st") %>% pull(Baseline)
-discount_rate <- assumptions_data %>% filter(Parameters == "Discount_Rate") %>% pull(Baseline)
-study_costs <- assumptions_data %>% filter(Parameters == "Study_Costs") %>% pull(Baseline)
+# Helper: pull a single baseline value cleanly
+get_assumption <- function(df, p_name) {
+  df %>% filter(trimws(Parameters) == p_name) %>% pull(Baseline)
+}
 
-prob_study_on_time <- assumptions_data %>% filter(Parameters == "Prob_Study_On_Time") %>% pull(Baseline)
-prob_ema_approved  <- assumptions_data %>% filter(Parameters == "Prob_EMA_Approved") %>% pull(Baseline)
+# --- Pull baseline scalars ---
+price_per_pack     <- get_assumption(assumptions_data, "Price_Per_pack(1mg)30st")
+discount_rate      <- get_assumption(assumptions_data, "Discount_Rate")
+study_costs        <- get_assumption(assumptions_data, "Study_Costs")
+prob_study_on_time <- get_assumption(assumptions_data, "Prob_Study_On_Time")
+prob_ema_approved  <- get_assumption(assumptions_data, "Prob_EMA_Approved")
+prob_access_scan   <- get_assumption(assumptions_data, "Scandinavian_prob_client_aquisition")
+prob_access_uk     <- get_assumption(assumptions_data, "UK_annual_prob_client_aquisition")
+prob_access_nl     <- get_assumption(assumptions_data, "NL_annual_prob_client_aquisition")
+prob_access_de     <- get_assumption(assumptions_data, "DE_annual_prob_client_aquisition")
+# Hidden Costs: % of Gross Revenue lost to unplanned costs (distribution,
+# chargebacks, write-offs, etc.). Applied as a revenue haircut.
+hidden_costs_pct   <- get_assumption(assumptions_data, "Hidden Costs")
 
-prob_access_scan <- assumptions_data %>% filter(Parameters == "Scandinavian_prob_client_aquisition") %>% pull(Baseline)
-prob_access_uk   <- assumptions_data %>% filter(Parameters == "UK_annual_prob_client_aquisition") %>% pull(Baseline)
-prob_access_nl   <- assumptions_data %>% filter(Parameters == "NL_annual_prob_client_aquisition") %>% pull(Baseline)
-prob_access_de   <- assumptions_data %>% filter(Parameters == "DE_annual_prob_client_aquisition") %>% pull(Baseline)
 
-combined_data <- left_join(revenue_data, costs_data, by = c("Country", "Year"))
+# The Costs sheet has two types of rows:
+#   (a) COGS rows  — Des. == "COGS_Per_pack30", one per country per year
+#   (b) Fee rows   — Des. == a fee name (e.g. "MRP fee NL"), one-off or annual
+#   (c) Study cost — Country == "NL", Des. == "Study_Costs " → EXCLUDED here
+#                    (handled via Assumptions tab to avoid double-counting)
+#
+# Strategy:
+#   1. Exclude the Study_Costs row (tagged as NL in this data version).
+#   2. Map DK/FL/NO/SE sub-countries → "Scandinavian" umbrella and SUM costs.
+#   3. Separate COGS rows from fee rows.
+#   4. Pivot fee rows wide so each fee gets its own column.
+#   5. Join COGS and fees back together, then join to revenue.
+
+# Step 1 & 2: Exclude Study_Costs and remap Scandinavian sub-countries
+costs_remapped <- costs_data %>%
+  filter(trimws(Des.) != "Study_Costs") %>%          # remove study cost row
+  mutate(
+    Country = case_when(
+      Country %in% c("DK", "FL", "NO", "SE", "Scandinavian") ~ "Scandinavian",
+      TRUE ~ Country
+    )
+  )
+
+# Step 3a: Extract COGS rows (one value per Country × Year after summing subs)
+cogs_clean <- costs_remapped %>%
+  filter(Des. == "COGS_Per_pack30") %>%
+  group_by(Country, Year) %>%
+  summarise(COGS_Per_pack30 = sum(Cost_Value, na.rm = TRUE), .groups = "drop")
+
+# Step 3b: Extract fee rows, group (sum Scandinavian sub-countries), pivot wide
+fees_clean <- costs_remapped %>%
+  filter(Des. != "COGS_Per_pack30") %>%
+  group_by(Country, Year, Des.) %>%
+  summarise(Cost_Value = sum(Cost_Value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = Des.,
+    values_from = Cost_Value,
+    values_fill = list(Cost_Value = 0)
+  )
+
+# Step 4: Merge COGS and fees into one costs table
+costs_clean <- full_join(cogs_clean, fees_clean, by = c("Country", "Year"))
+
+
+combined_data <- left_join(revenue_data, costs_clean, by = c("Country", "Year"))
+
+# All possible fee column names (any_of handles missing ones gracefully)
+fee_columns <- c(
+  "NL Initital Registration", "NL annaul fee", "MRP fee NL",
+  "MRP fee DE", "MRP fee DK", "MRP fee FL", "MRP fee NO", "MRP fee SE",
+  "UK registration",
+  "MRP fee NL annually", "MRP fee DE annually", "MRP fee DK annually",
+  "MRP fee FL annually", "MRP fee NO annually", "MRP fee SE annually",
+  "UK registration annually"
+)
 
 cash_flow_data <- combined_data %>%
+  rowwise() %>%
   mutate(
-    Gross_Revenue = `Pack of 30` * Market_Share_Pct * price_per_pack,
-    Total_COGS = `Pack of 30` * Market_Share_Pct * COGS_Per_pack30,
-    Operating_Cash_Flow = Gross_Revenue - Total_COGS,
-    Discounted_CF = Operating_Cash_Flow / ((1 + discount_rate) ^ Year)
+    Total_Fixed_Costs = sum(c_across(any_of(fee_columns)), na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    Gross_Revenue        = Total_Market_Pack * Market_Share_Pct * price_per_pack,
+    Hidden_Costs         = Gross_Revenue * hidden_costs_pct,
+    Total_COGS           = Total_Market_Pack * Market_Share_Pct * COGS_Per_pack30,
+    Operating_Cash_Flow  = Gross_Revenue - Hidden_Costs - Total_COGS - Total_Fixed_Costs,
+    Discounted_CF        = Operating_Cash_Flow / ((1 + discount_rate) ^ Year)
   )
+
 
 npv_by_country <- cash_flow_data %>%
   group_by(Country) %>%
-  summarise(Country_NPV = sum(Discounted_CF)) %>%
+  summarise(Country_NPV = sum(Discounted_CF), .groups = "drop") %>%
   mutate(
     Prob_Acquisition = case_when(
       Country == "Scandinavian" ~ prob_access_scan,
@@ -46,43 +117,53 @@ npv_by_country <- cash_flow_data %>%
     Risk_Adjusted_NPV = Country_NPV * Prob_Acquisition
   )
 
-print("--- VERIFICATION: MARKET LEVEL RISK ADJUSTMENT ---")
+cat("\n--- VERIFICATION: MARKET LEVEL RISK ADJUSTMENT ---\n")
 print(npv_by_country)
 
-payoff_on_time <- sum(npv_by_country$Risk_Adjusted_NPV) - (study_costs / ((1 + discount_rate) ^ 1))
+# Decision tree payoffs
+# On-time: full 5-year cash flows, minus PV of study cost
+payoff_on_time <- sum(npv_by_country$Risk_Adjusted_NPV) -
+  (study_costs / ((1 + discount_rate) ^ 1))
 
+# Delayed: Year 1 cash flow dropped (= 0), otherwise same
 payoff_delayed <- cash_flow_data %>%
   mutate(
-    Delayed_Op_CF = if_else(Year == 1, 0, Operating_Cash_Flow),
+    Delayed_Op_CF  = if_else(Year == 1, 0, Operating_Cash_Flow),
     Delayed_Disc_CF = Delayed_Op_CF / ((1 + discount_rate) ^ Year)
   ) %>%
   group_by(Country) %>%
-  summarise(Delayed_Country_NPV = sum(Delayed_Disc_CF)) %>%
+  summarise(Delayed_Country_NPV = sum(Delayed_Disc_CF), .groups = "drop") %>%
   left_join(npv_by_country %>% select(Country, Prob_Acquisition), by = "Country") %>%
   mutate(Delayed_Risk_Adj_NPV = Delayed_Country_NPV * Prob_Acquisition) %>%
   summarise(Total = sum(Delayed_Risk_Adj_NPV)) %>%
   pull(Total) - (study_costs / ((1 + discount_rate) ^ 1))
 
+# Build decision tree
 mellozzan_tree <- Node$new("Mellozzan Project")
+
 on_time_node <- mellozzan_tree$AddChild("Study: On Time")
 on_time_node$probability <- prob_study_on_time
-delayed_node <- mellozzan_tree$AddChild("Study: Delayed")
-delayed_node$probability <- 1 - prob_study_on_time
 
 app_on_time <- on_time_node$AddChild("EMA Approved (Fast)")
 app_on_time$probability <- prob_ema_approved
-app_on_time$payoff <- payoff_on_time
+app_on_time$payoff      <- payoff_on_time
+
 rej_on_time <- on_time_node$AddChild("EMA Rejected (Fast)")
 rej_on_time$probability <- 1 - prob_ema_approved
-rej_on_time$payoff <- 0
+rej_on_time$payoff      <- 0
+
+delayed_node <- mellozzan_tree$AddChild("Study: Delayed")
+delayed_node$probability <- 1 - prob_study_on_time
 
 app_delayed <- delayed_node$AddChild("EMA Approved (Slow)")
 app_delayed$probability <- prob_ema_approved
-app_delayed$payoff <- payoff_delayed
+app_delayed$payoff      <- payoff_delayed
+
 rej_delayed <- delayed_node$AddChild("EMA Rejected (Slow)")
 rej_delayed$probability <- 1 - prob_ema_approved
-rej_delayed$payoff <- 0
+rej_delayed$payoff      <- 0
 
+# Roll back expected values
 calculate_ev <- function(node) {
   if (node$isLeaf) {
     node$expected_value <- node$payoff
@@ -96,84 +177,89 @@ calculate_ev <- function(node) {
 
 project_enpv <- calculate_ev(mellozzan_tree)
 
+cat("\n--- DECISION TREE ---\n")
 print(mellozzan_tree, "probability", "payoff", "expected_value")
-print(paste("Final Project eNPV (Risk-Adjusted):", round(project_enpv, 2)))
+cat(paste("Final Project eNPV (Risk-Adjusted): €",
+          formatC(project_enpv, format = "f", digits = 2, big.mark = ","), "\n"))
 
-# --- PHASE 4, STEP 7: BASELINE BREAK-EVEN ANALYSIS ---
 
-# 1. Sum up the cash flows across all countries for each year
 yearly_breakdown <- cash_flow_data %>%
   group_by(Year) %>%
   summarise(
-    Yearly_Operating_CF = sum(Operating_Cash_Flow),
-    Yearly_Discounted_CF = sum(Discounted_CF)
-  )
-
-# 2. Subtract the Study Cost from Year 1 and calculate Cumulative NPV
-yearly_breakdown <- yearly_breakdown %>%
+    Yearly_Operating_CF  = sum(Operating_Cash_Flow),
+    Yearly_Discounted_CF = sum(Discounted_CF),
+    .groups = "drop"
+  ) %>%
   mutate(
-    Net_Yearly_NPV = if_else(Year == 1, 
-                             Yearly_Discounted_CF - (study_costs / ((1 + discount_rate) ^ 1)), 
-                             Yearly_Discounted_CF),
+    # Study cost is a Year-1 outlay; subtract its PV only in Year 1
+    Net_Yearly_NPV = if_else(
+      Year == 1,
+      Yearly_Discounted_CF - (study_costs / ((1 + discount_rate) ^ 1)),
+      Yearly_Discounted_CF
+    ),
     Cumulative_NPV = cumsum(Net_Yearly_NPV)
   )
 
-# 3. Identify the exact Break-Even Year
-# It finds the first year where Cumulative_NPV is greater than 0
 break_even_year <- yearly_breakdown %>%
   filter(Cumulative_NPV > 0) %>%
   slice(1) %>%
   pull(Year)
 
-# 4. Print the results
-print("--- BASELINE CUMULATIVE NPV & BREAK-EVEN ---")
+cat("\n--- BASELINE CUMULATIVE NPV & BREAK-EVEN ---\n")
 print(yearly_breakdown %>% select(Year, Net_Yearly_NPV, Cumulative_NPV))
 
-if(length(break_even_year) > 0) {
-  print(paste("Baseline Break-Even achieved in Year:", break_even_year))
+if (length(break_even_year) > 0) {
+  cat(paste("Baseline Break-Even achieved in Year:", break_even_year, "\n"))
 } else {
-  print("Baseline Break-Even is NOT achieved within 5 years.")
+  cat("Baseline Break-Even is NOT achieved within the forecast horizon.\n")
 }
 
+# IMPORTANT DESIGN NOTE:
+#   combined_data is used as the base inside run_mellozzan_model.
+#   It is constructed ONCE from the baseline data and reused.
+#   Volume and market share are SCALED relative to their baseline values,
+#   so we never need to re-join raw sheets inside the loop — only scalars change.
 
-# --- UPGRADE: STEP 2 - DYNAMIC ENGINE WITH BREAK-EVEN & DSA LOOP ---
-
-# 1. The Upgraded Engine
 run_mellozzan_model <- function(current_assumptions) {
   
-  get_val <- function(p_name) { current_assumptions %>% filter(Parameters == p_name) %>% pull(Baseline) }
-  get_base <- function(p_name) { assumptions_data %>% filter(Parameters == p_name) %>% pull(Baseline) }
+  gv <- function(p) current_assumptions %>% filter(trimws(Parameters) == p) %>% pull(Baseline)
+  gb <- function(p) assumptions_data    %>% filter(trimws(Parameters) == p) %>% pull(Baseline)
   
-  price_per_pack     <- get_val("Price_Per_pack(1mg)30st")
-  discount_rate      <- get_val("Discount_Rate") 
-  study_costs        <- get_val("Study_Costs")
-  prob_study_on_time <- get_val("Prob_Study_On_Time")
-  prob_ema_approved  <- get_val("Prob_EMA_Approved")
+  # Scalars from current scenario
+  price_per_pack     <- gv("Price_Per_pack(1mg)30st")
+  discount_rate      <- gv("Discount_Rate")
+  study_costs        <- gv("Study_Costs")
+  prob_study_on_time <- gv("Prob_Study_On_Time")
+  prob_ema_approved  <- gv("Prob_EMA_Approved")
+  prob_access_scan   <- gv("Scandinavian_prob_client_aquisition")
+  prob_access_uk     <- gv("UK_annual_prob_client_aquisition")
+  prob_access_nl     <- gv("NL_annual_prob_client_aquisition")
+  prob_access_de     <- gv("DE_annual_prob_client_aquisition")
+  hidden_costs_pct   <- gv("Hidden Costs")
   
-  prob_access_scan   <- get_val("Scandinavian_prob_client_aquisition")
-  prob_access_uk     <- get_val("UK_annual_prob_client_aquisition")
-  prob_access_nl     <- get_val("NL_annual_prob_client_aquisition")
-  prob_access_de     <- get_val("DE_annual_prob_client_aquisition")
+  # Volume scaling factors (ratio of scenario value to baseline value)
+  scale_vol_scan <- gv("Scandinavian_annual_tablets") / gb("Scandinavian_annual_tablets")
+  scale_vol_uk   <- gv("UK_annual_tablets")           / gb("UK_annual_tablets")
+  scale_vol_nl   <- gv("NL_annual_tablets")           / gb("NL_annual_tablets")
+  scale_vol_de   <- gv("DE_annual_tablets")           / gb("DE_annual_tablets")
   
-  scale_vol_scan <- get_val("Scandinavian_annual_tablets") / get_base("Scandinavian_annual_tablets")
-  scale_vol_uk   <- get_val("UK_annual_tablets") / get_base("UK_annual_tablets")
-  scale_vol_nl   <- get_val("NL_annual_tablets") / get_base("NL_annual_tablets")
-  scale_vol_de   <- get_val("DE_annual_tablets") / get_base("DE_annual_tablets")
+  # Market share scaling factors
+  scale_shr_scan <- gv("Scandinavian_Peak_Market_Share") / gb("Scandinavian_Peak_Market_Share")
+  scale_shr_uk   <- gv("UK_annual_Peak_Market_Share")    / gb("UK_annual_Peak_Market_Share")
+  scale_shr_nl   <- gv("NL_annual_Peak_Market_Share")    / gb("NL_annual_Peak_Market_Share")
+  scale_shr_de   <- gv("DE_annual_Peak_Market_Share")    / gb("DE_annual_Peak_Market_Share")
   
-  scale_shr_scan <- get_val("Scandinavian_Peak_Market_Share") / get_base("Scandinavian_Peak_Market_Share")
-  scale_shr_uk   <- get_val("UK_annual_Peak_Market_Share") / get_base("UK_annual_Peak_Market_Share")
-  scale_shr_nl   <- get_val("NL_annual_Peak_Market_Share") / get_base("NL_annual_Peak_Market_Share")
-  scale_shr_de   <- get_val("DE_annual_Peak_Market_Share") / get_base("DE_annual_Peak_Market_Share")
+  # COGS scaling factor (Year 1 COGS drives the scalar; all years scale proportionally)
+  scale_cogs <- gv("COGS_Per_pack30_year1") / gb("COGS_Per_pack30_year1")
   
-  scale_cogs <- get_val("COGS_Per_pack30_year1") / get_base("COGS_Per_pack30_year1")
-  
+  # Apply scaling to combined_data (which already has COGS_Per_pack30 correctly named)
   temp_cash_flow <- combined_data %>%
     mutate(
-      `Pack of 30` = case_when(
-        Country == "Scandinavian" ~ `Pack of 30` * scale_vol_scan,
-        Country == "UK"           ~ `Pack of 30` * scale_vol_uk,
-        Country == "NL"           ~ `Pack of 30` * scale_vol_nl,
-        Country == "DE"           ~ `Pack of 30` * scale_vol_de
+      Total_Market_Pack = case_when(
+        Country == "Scandinavian" ~ Total_Market_Pack * scale_vol_scan,
+        Country == "UK"           ~ Total_Market_Pack * scale_vol_uk,
+        Country == "NL"           ~ Total_Market_Pack * scale_vol_nl,
+        Country == "DE"           ~ Total_Market_Pack * scale_vol_de
       ),
       Market_Share_Pct = case_when(
         Country == "Scandinavian" ~ Market_Share_Pct * scale_shr_scan,
@@ -181,17 +267,25 @@ run_mellozzan_model <- function(current_assumptions) {
         Country == "NL"           ~ Market_Share_Pct * scale_shr_nl,
         Country == "DE"           ~ Market_Share_Pct * scale_shr_de
       ),
-      COGS_Per_pack30 = COGS_Per_pack30 * scale_cogs,
-      
-      Gross_Revenue = `Pack of 30` * Market_Share_Pct * price_per_pack,
-      Total_COGS = `Pack of 30` * Market_Share_Pct * COGS_Per_pack30,
-      Operating_Cash_Flow = Gross_Revenue - Total_COGS,
-      Discounted_CF = Operating_Cash_Flow / ((1 + discount_rate) ^ Year)
+      # Scale COGS — applied to the already year-varying COGS column
+      COGS_Per_pack30 = COGS_Per_pack30 * scale_cogs
+    ) %>%
+    rowwise() %>%
+    mutate(
+      Total_Fixed_Costs = sum(c_across(any_of(fee_columns)), na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    mutate(
+      Gross_Revenue       = Total_Market_Pack * Market_Share_Pct * price_per_pack,
+      Hidden_Costs        = Gross_Revenue * hidden_costs_pct,
+      Total_COGS          = Total_Market_Pack * Market_Share_Pct * COGS_Per_pack30,
+      Operating_Cash_Flow = Gross_Revenue - Hidden_Costs - Total_COGS - Total_Fixed_Costs,
+      Discounted_CF       = Operating_Cash_Flow / ((1 + discount_rate) ^ Year)
     )
   
   temp_npv_by_country <- temp_cash_flow %>%
     group_by(Country) %>%
-    summarise(Country_NPV = sum(Discounted_CF)) %>%
+    summarise(Country_NPV = sum(Discounted_CF), .groups = "drop") %>%
     mutate(
       Prob_Acquisition = case_when(
         Country == "Scandinavian" ~ prob_access_scan,
@@ -202,94 +296,99 @@ run_mellozzan_model <- function(current_assumptions) {
       Risk_Adjusted_NPV = Country_NPV * Prob_Acquisition
     )
   
-  payoff_on_time <- sum(temp_npv_by_country$Risk_Adjusted_NPV) - (study_costs / ((1 + discount_rate) ^ 1))
+  payoff_on_time <- sum(temp_npv_by_country$Risk_Adjusted_NPV) -
+    (study_costs / ((1 + discount_rate) ^ 1))
   
   payoff_delayed <- temp_cash_flow %>%
     mutate(
-      Delayed_Op_CF = if_else(Year == 1, 0, Operating_Cash_Flow),
+      Delayed_Op_CF   = if_else(Year == 1, 0, Operating_Cash_Flow),
       Delayed_Disc_CF = Delayed_Op_CF / ((1 + discount_rate) ^ Year)
     ) %>%
     group_by(Country) %>%
-    summarise(Delayed_Country_NPV = sum(Delayed_Disc_CF)) %>%
+    summarise(Delayed_Country_NPV = sum(Delayed_Disc_CF), .groups = "drop") %>%
     left_join(temp_npv_by_country %>% select(Country, Prob_Acquisition), by = "Country") %>%
     mutate(Delayed_Risk_Adj_NPV = Delayed_Country_NPV * Prob_Acquisition) %>%
     summarise(Total = sum(Delayed_Risk_Adj_NPV)) %>%
     pull(Total) - (study_costs / ((1 + discount_rate) ^ 1))
   
-  temp_tree <- Node$new("Temp")
-  on_time_node <- temp_tree$AddChild("OnTime", probability = prob_study_on_time)
-  delayed_node <- temp_tree$AddChild("Delayed", probability = 1 - prob_study_on_time)
-  
-  app_on_time <- on_time_node$AddChild("AppFast", probability = prob_ema_approved, payoff = payoff_on_time)
-  rej_on_time <- on_time_node$AddChild("RejFast", probability = 1 - prob_ema_approved, payoff = 0)
-  
-  app_delayed <- delayed_node$AddChild("AppSlow", probability = prob_ema_approved, payoff = payoff_delayed)
-  rej_delayed <- delayed_node$AddChild("RejSlow", probability = 1 - prob_ema_approved, payoff = 0)
+  # Decision tree rollback
+  temp_tree    <- Node$new("Temp")
+  on_t         <- temp_tree$AddChild("OnTime",  probability = prob_study_on_time)
+  del_t        <- temp_tree$AddChild("Delayed", probability = 1 - prob_study_on_time)
+  on_t$AddChild("AppFast", probability = prob_ema_approved,     payoff = payoff_on_time)
+  on_t$AddChild("RejFast", probability = 1 - prob_ema_approved, payoff = 0)
+  del_t$AddChild("AppSlow", probability = prob_ema_approved,     payoff = payoff_delayed)
+  del_t$AddChild("RejSlow", probability = 1 - prob_ema_approved, payoff = 0)
   
   calc_ev <- function(node) {
-    if (node$isLeaf) { return(node$payoff) } 
-    else { return(sum(sapply(node$children, function(child) { child$probability * calc_ev(child) }))) }
+    if (node$isLeaf) return(node$payoff)
+    sum(sapply(node$children, function(child) child$probability * calc_ev(child)))
   }
   
   final_enpv <- calc_ev(temp_tree)
   
-  # --- THE NEW BREAK-EVEN MATH ---
+  # Break-even: first year cumulative NPV goes positive (and stays positive
+  # through end of horizon — handles edge case of re-crossing zero)
   temp_yearly <- temp_cash_flow %>%
     group_by(Year) %>%
-    summarise(Yearly_Discounted_CF = sum(Discounted_CF)) %>%
+    summarise(Yearly_Discounted_CF = sum(Discounted_CF), .groups = "drop") %>%
     mutate(
-      Net_Yearly_NPV = if_else(Year == 1, 
-                               Yearly_Discounted_CF - (study_costs / ((1 + discount_rate) ^ 1)), 
-                               Yearly_Discounted_CF),
+      Net_Yearly_NPV = if_else(
+        Year == 1,
+        Yearly_Discounted_CF - (study_costs / ((1 + discount_rate) ^ 1)),
+        Yearly_Discounted_CF
+      ),
       Cumulative_NPV = cumsum(Net_Yearly_NPV)
     )
   
-  # Find the first year it turns positive. If it never does, assign NA.
-  be_year <- temp_yearly %>% filter(Cumulative_NPV > 0) %>% slice(1) %>% pull(Year)
-  if(length(be_year) == 0) { be_year <- NA }
+  # Only count break-even if cumulative NPV stays positive from that year onward
+  max_year <- max(temp_yearly$Year)
+  be_year  <- NA
   
-  # The engine now returns BOTH values as a list!
-  return(list(
-    eNPV = final_enpv,
-    BreakEven = be_year
-  ))
+  for (yr in temp_yearly$Year) {
+    cum_from_here <- temp_yearly %>% filter(Year >= yr) %>% pull(Cumulative_NPV)
+    if (all(cum_from_here > 0)) {
+      be_year <- yr
+      break
+    }
+  }
+  
+  return(list(eNPV = final_enpv, BreakEven = be_year))
 }
 
 
-# 2. RUN THE UPGRADED DSA LOOP
-
 dsa_params <- assumptions_data %>% filter(Min != Max)
 
-# We expanded the table to hold the new Break-Even results
 dsa_results <- data.frame(
-  Parameter = character(), Min_Value = numeric(), Max_Value = numeric(),
-  eNPV_at_Min = numeric(), eNPV_at_Max = numeric(), 
-  BreakEven_at_Min = numeric(), BreakEven_at_Max = numeric(), # NEW COLUMNS
+  Parameter        = character(),
+  Min_Value        = numeric(),
+  Max_Value        = numeric(),
+  eNPV_at_Min      = numeric(),
+  eNPV_at_Max      = numeric(),
+  BreakEven_at_Min = numeric(),
+  BreakEven_at_Max = numeric(),
   stringsAsFactors = FALSE
 )
 
-for (i in 1:nrow(dsa_params)) {
+for (i in seq_len(nrow(dsa_params))) {
   param_name <- dsa_params$Parameters[i]
   
-  # Run MIN
   temp_min <- assumptions_data
   temp_min$Baseline[temp_min$Parameters == param_name] <- dsa_params$Min[i]
-  res_min <- run_mellozzan_model(temp_min) # res_min now holds $eNPV and $BreakEven
+  res_min  <- run_mellozzan_model(temp_min)
   
-  # Run MAX
   temp_max <- assumptions_data
   temp_max$Baseline[temp_max$Parameters == param_name] <- dsa_params$Max[i]
-  res_max <- run_mellozzan_model(temp_max) # res_max now holds $eNPV and $BreakEven
+  res_max  <- run_mellozzan_model(temp_max)
   
-  # Save the results
   dsa_results <- rbind(dsa_results, data.frame(
-    Parameter = param_name,
-    Min_Value = dsa_params$Min[i],
-    Max_Value = dsa_params$Max[i],
-    eNPV_at_Min = res_min$eNPV,
-    eNPV_at_Max = res_max$eNPV,
-    BreakEven_at_Min = res_min$BreakEven,
-    BreakEven_at_Max = res_max$BreakEven
+    Parameter        = param_name,
+    Min_Value        = dsa_params$Min[i],
+    Max_Value        = dsa_params$Max[i],
+    eNPV_at_Min      = res_min$eNPV,
+    eNPV_at_Max      = res_max$eNPV,
+    BreakEven_at_Min = ifelse(is.na(res_min$BreakEven), NA_real_, res_min$BreakEven),
+    BreakEven_at_Max = ifelse(is.na(res_max$BreakEven), NA_real_, res_max$BreakEven)
   ))
 }
 
@@ -297,175 +396,147 @@ dsa_results <- dsa_results %>%
   mutate(Swing = abs(eNPV_at_Max - eNPV_at_Min)) %>%
   arrange(desc(Swing))
 
-print("--- DSA SWING RESULTS (WITH BREAK-EVEN) ---")
-print(dsa_results %>% select(Parameter, eNPV_at_Min, eNPV_at_Max, BreakEven_at_Min, BreakEven_at_Max))
+cat("\n--- DSA SWING RESULTS (WITH BREAK-EVEN) ---\n")
+print(dsa_results %>% select(Parameter, eNPV_at_Min, eNPV_at_Max,
+                             BreakEven_at_Min, BreakEven_at_Max, Swing))
 
-# --- PHASE 5, STEP 3: DRAW THE TORNADO CHART (ALL PARAMETERS) ---
+# Tornado chart
+tornado_data <- dsa_results %>%
+  arrange(Swing) %>%
+  mutate(Parameter = factor(Parameter, levels = Parameter))
 
-# 1. Grab your baseline eNPV
-baseline_val <- project_enpv 
-
-# 2. Prepare the data: Remove the top 10 filter so ALL variables are included
-all_dsa <- dsa_results %>%
-  arrange(Swing) %>%  # Keep them sorted so the biggest is at the top
-  mutate(Parameter = factor(Parameter, levels = Parameter)) # Locks the sorting order
-
-# 3. Create the standard Tornado Chart
-ggplot(all_dsa) +
-  # Draw a vertical line showing the baseline expectation
-  geom_vline(xintercept = baseline_val, linetype = "dashed", color = "darkred", linewidth = 1) +
-  
-  # Draw the "Swing" bars from the Min eNPV to the Max eNPV
-  geom_segment(aes(y = Parameter, yend = Parameter, x = eNPV_at_Min, xend = eNPV_at_Max), 
-               linewidth = 5, color = "steelblue") +
-  
-  # Clean up the visual theme
-  theme_minimal() +
+ggplot(tornado_data) +
+  geom_vline(xintercept = project_enpv,
+             linetype = "dashed", color = "darkred", linewidth = 1) +
+  geom_segment(aes(y = Parameter, yend = Parameter,
+                   x = eNPV_at_Min, xend = eNPV_at_Max),
+               linewidth = 5, color = "steelblue", alpha = 0.85) +
+  theme_minimal(base_size = 11) +
   labs(
-    title = "Tornado Chart: Deterministic Sensitivity Analysis",
+    title    = "Tornado Chart: Deterministic Sensitivity Analysis",
     subtitle = "Impact of individual parameters on Expected Net Present Value (eNPV)",
-    x = "Project eNPV (€)",
-    y = "Risk Parameters",
-    caption = "Red dashed line represents Baseline eNPV"
-  ) +
-  scale_x_continuous(labels = scales::comma) + 
-  theme(
-    axis.text.y = element_text(size = 8, face = "bold"), 
-    axis.title.x = element_text(margin = margin(t = 10, r = 0, b = 0, l = 0)),
-    plot.title = element_text(size = 14, face = "bold")
-  )
-
-# --- PHASE 6, STEP 1: SETUP RANDOM NUMBER GENERATION (PERT) ---
-
-library(mc2d)
-
-# 1. Define how many alternate realities we want to simulate
-n_sims <- 10000
-
-# 2. Grab the variables that actually fluctuate (Min != Max)
-psa_params <- assumptions_data %>% filter(Min != Max)
-
-# 3. Create a massive table to hold our 10,000 different scenarios
-simulated_inputs <- data.frame(Simulation_ID = 1:n_sims)
-
-# 4. Generate 10,000 random numbers for EVERY parameter using the PERT distribution
-for (i in 1:nrow(psa_params)) {
-  param_name <- psa_params$Parameters[i]
-  min_val    <- psa_params$Min[i]
-  base_val   <- psa_params$Baseline[i]
-  max_val    <- psa_params$Max[i]
-  
-  # rpert generates random numbers weighted heavily toward the baseline (mode)
-  simulated_inputs[[param_name]] <- rpert(n_sims, min = min_val, mode = base_val, max = max_val)
-}
-
-print("--- STEP 1 COMPLETE: 10,000 Scenarios Generated Successfully ---")
-
-# --- UPGRADE: STEP 3 - MONTE CARLO LOOP WITH BREAK-EVEN ---
-
-# 1. Create empty vectors to store BOTH results for all 10,000 runs
-psa_enpv_results <- numeric(n_sims)
-psa_breakeven_results <- numeric(n_sims) # NEW: Stores the break-even year
-
-print("Starting Simulation Engine (with Break-Even Tracking)... This takes 30-60 seconds.")
-
-# 2. Feed all 10,000 scenarios through the Upgraded Engine
-for (sim in 1:n_sims) {
-  
-  if (sim %% 1000 == 0) {
-    print(paste("Running simulation", sim, "of", n_sims, "..."))
-  }
-  
-  current_sim_assumptions <- assumptions_data
-  
-  for (i in 1:nrow(psa_params)) {
-    param_name <- psa_params$Parameters[i]
-    current_sim_assumptions$Baseline[current_sim_assumptions$Parameters == param_name] <- simulated_inputs[[param_name]][sim]
-  }
-  
-  # Run the engine and extract BOTH outputs!
-  sim_results <- run_mellozzan_model(current_sim_assumptions)
-  
-  psa_enpv_results[sim] <- sim_results$eNPV
-  psa_breakeven_results[sim] <- sim_results$BreakEven
-}
-
-print("--- STEP 3 COMPLETE: Monte Carlo Simulation Finished! ---")
-
-
-# --- UPGRADE: STEP 4 - CALCULATE NEW STATISTICS & EXECUTIVE SUMMARY ---
-
-# Core financial stats
-mean_enpv <- mean(psa_enpv_results)
-median_enpv <- median(psa_enpv_results)
-ci_lower <- quantile(psa_enpv_results, 0.025)
-ci_upper <- quantile(psa_enpv_results, 0.975)
-prob_of_loss <- sum(psa_enpv_results < 0) / n_sims * 100
-
-# NEW: Calculate Break-Even Probabilities
-# We count how many times each year (or NA/Never) appears in our 10,000 runs
-be_counts <- table(psa_breakeven_results, useNA = "always")
-be_probs <- round((be_counts / n_sims) * 100, 1)
-
-# Print the final Executive Summary
-print("==================================================")
-print("     MONTE CARLO SIMULATION: EXECUTIVE SUMMARY    ")
-print("==================================================")
-print(paste("Mean Expected NPV:      €", formatC(mean_enpv, format="f", digits=0, big.mark=",")))
-print(paste("Median Expected NPV:    €", formatC(median_enpv, format="f", digits=0, big.mark=",")))
-print(paste("Worst Case (95% CI):    €", formatC(ci_lower, format="f", digits=0, big.mark=",")))
-print(paste("Best Case (95% CI):     €", formatC(ci_upper, format="f", digits=0, big.mark=",")))
-print(paste("Probability of Loss:   ", round(prob_of_loss, 2), "%"))
-print("--------------------------------------------------")
-print("           BREAK-EVEN TIMELINE RISKS              ")
-print("--------------------------------------------------")
-
-# Dynamically print the probability of breaking even in each year
-for (yr in names(be_probs)) {
-  if (is.na(yr)) {
-    print(paste("Never breaks even (Loss): ", be_probs[yr], "%"))
-  } else {
-    print(paste("Breaks even in Year", yr, ":   ", be_probs[yr], "%"))
-  }
-}
-print("==================================================")
-
-# --- PHASE 6, STEP 4: VISUALIZE THE RISK PROFILE ---
-
-library(ggplot2)
-
-# 1. Put the 10,000 results into a data frame for plotting
-plot_data <- data.frame(eNPV = psa_enpv_results)
-
-# 2. Create the Risk Histogram / Density Plot
-ggplot(plot_data, aes(x = eNPV)) +
-  # Draw the histogram background
-  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "lightblue", color = "black", alpha = 0.6) +
-  
-  # Draw the smooth bell curve over the top
-  geom_density(color = "darkblue", linewidth = 1.2) +
-  
-  # Add a dashed line for the Mean
-  geom_vline(aes(xintercept = mean_enpv), color = "darkred", linetype = "dashed", linewidth = 1) +
-  
-  # Add dotted lines for the 95% Confidence Interval (Worst and Best Case)
-  geom_vline(aes(xintercept = ci_lower), color = "black", linetype = "dotted", linewidth = 1) +
-  geom_vline(aes(xintercept = ci_upper), color = "black", linetype = "dotted", linewidth = 1) +
-  
-  # Clean up the visual theme
-  theme_minimal() +
-  labs(
-    title = "Probabilistic Sensitivity Analysis (Monte Carlo)",
-    subtitle = paste0("10,000 Simulations | 95% Confidence Interval: €", 
-                      formatC(ci_lower, format="d", big.mark=","), " to €", 
-                      formatC(ci_upper, format="d", big.mark=",")),
-    x = "Project Risk-Adjusted eNPV (€)",
-    y = "Probability Density",
-    caption = "Red line = Mean eNPV | Black dotted lines = 95% Confidence Interval"
+    x        = "Project eNPV (€)",
+    y        = NULL,
+    caption  = "Red dashed line = Baseline eNPV"
   ) +
   scale_x_continuous(labels = scales::comma) +
   theme(
-    plot.title = element_text(size = 14, face = "bold"),
+    axis.text.y  = element_text(size = 8, face = "bold"),
     axis.title.x = element_text(margin = margin(t = 10)),
-    axis.text.y = element_blank() # Hide y-axis numbers as they are just raw density metrics
+    plot.title   = element_text(size = 14, face = "bold")
+  )
+
+
+set.seed(42)   # reproducibility
+n_sims     <- 10000
+psa_params <- assumptions_data %>% filter(Min != Max)
+
+# Pre-generate all PERT samples at once (faster than sampling inside loop)
+simulated_inputs <- data.frame(Simulation_ID = seq_len(n_sims))
+
+for (i in seq_len(nrow(psa_params))) {
+  param_name <- psa_params$Parameters[i]
+  simulated_inputs[[param_name]] <- rpert(
+    n_sims,
+    min  = psa_params$Min[i],
+    mode = psa_params$Baseline[i],
+    max  = psa_params$Max[i]
+  )
+}
+
+cat("\n--- STEP 1 COMPLETE: 10,000 Scenarios Generated (PERT) ---\n")
+
+psa_enpv_results     <- numeric(n_sims)
+psa_breakeven_results <- rep(NA_real_, n_sims)
+
+cat("Starting Monte Carlo engine...\n")
+
+for (sim in seq_len(n_sims)) {
+  if (sim %% 1000 == 0) cat(paste("  Simulation", sim, "of", n_sims, "...\n"))
+  
+  current_assumptions <- assumptions_data
+  
+  for (i in seq_len(nrow(psa_params))) {
+    param_name <- psa_params$Parameters[i]
+    current_assumptions$Baseline[current_assumptions$Parameters == param_name] <-
+      simulated_inputs[[param_name]][sim]
+  }
+  
+  result <- run_mellozzan_model(current_assumptions)
+  
+  psa_enpv_results[sim]      <- result$eNPV
+  psa_breakeven_results[sim] <- ifelse(is.na(result$BreakEven), NA_real_,
+                                       result$BreakEven)
+}
+
+cat("--- Monte Carlo Complete ---\n")
+
+
+mean_enpv    <- mean(psa_enpv_results)
+median_enpv  <- median(psa_enpv_results)
+ci_lower     <- quantile(psa_enpv_results, 0.025)
+ci_upper     <- quantile(psa_enpv_results, 0.975)
+prob_of_loss <- mean(psa_enpv_results < 0) * 100
+
+be_counts <- table(factor(psa_breakeven_results,
+                          levels = c(sort(unique(na.omit(psa_breakeven_results))), NA)),
+                   useNA = "always")
+be_probs  <- round((be_counts / n_sims) * 100, 1)
+
+cat("\n==================================================\n")
+cat("     MONTE CARLO SIMULATION: EXECUTIVE SUMMARY    \n")
+cat("==================================================\n")
+cat(paste("Mean Expected NPV:      €", formatC(mean_enpv,   format = "f", digits = 0, big.mark = ","), "\n"))
+cat(paste("Median Expected NPV:    €", formatC(median_enpv, format = "f", digits = 0, big.mark = ","), "\n"))
+cat(paste("Worst Case (2.5%):      €", formatC(ci_lower,    format = "f", digits = 0, big.mark = ","), "\n"))
+cat(paste("Best Case  (97.5%):     €", formatC(ci_upper,    format = "f", digits = 0, big.mark = ","), "\n"))
+cat(paste("Probability of Loss:   ", round(prob_of_loss, 2), "%\n"))
+cat("--------------------------------------------------\n")
+cat("           BREAK-EVEN TIMELINE PROBABILITIES      \n")
+cat("--------------------------------------------------\n")
+
+for (yr in names(be_probs)) {
+  if (is.na(yr) || yr == "NA") {
+    cat(paste("Never breaks even (loss scenario):", be_probs[yr], "%\n"))
+  } else {
+    cat(paste("Breaks even in Year", yr, ":", be_probs[yr], "%\n"))
+  }
+}
+cat("==================================================\n")
+
+plot_data <- data.frame(eNPV = psa_enpv_results)
+
+ggplot(plot_data, aes(x = eNPV)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 60, fill = "lightblue", color = "grey40", alpha = 0.7) +
+  geom_density(color = "darkblue", linewidth = 1.2) +
+  geom_vline(xintercept = mean_enpv,
+             color = "darkred",  linetype = "dashed", linewidth = 1,   label = "Mean") +
+  geom_vline(xintercept = ci_lower,
+             color = "black",    linetype = "dotted", linewidth = 0.9) +
+  geom_vline(xintercept = ci_upper,
+             color = "black",    linetype = "dotted", linewidth = 0.9) +
+  annotate("text", x = mean_enpv, y = Inf,
+           label = paste0("Mean: €", formatC(mean_enpv, format = "d", big.mark = ",")),
+           vjust = 2, hjust = -0.1, color = "darkred", size = 3.5) +
+  theme_minimal(base_size = 11) +
+  labs(
+    title    = "Probabilistic Sensitivity Analysis (Monte Carlo — PERT)",
+    subtitle = paste0(
+      formatC(n_sims, format = "d", big.mark = ","),
+      " simulations  |  95% CI: €",
+      formatC(ci_lower, format = "d", big.mark = ","),
+      " to €",
+      formatC(ci_upper, format = "d", big.mark = ",")
+    ),
+    x       = "Project Risk-Adjusted eNPV (€)",
+    y       = "Probability Density",
+    caption = "Red dashed = Mean eNPV  |  Black dotted = 95% Confidence Interval"
+  ) +
+  scale_x_continuous(labels = scales::comma) +
+  theme(
+    plot.title   = element_text(size = 14, face = "bold"),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank()
   )
